@@ -20,15 +20,36 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"reflect"
 	"strconv"
 
-	"sigs.k8s.io/yaml/goyaml.v2"
+	kubejson "sigs.k8s.io/json"
+
+	yamlv2 "sigs.k8s.io/yaml/goyaml.v2"
+	yamlv3 "sigs.k8s.io/yaml/goyaml.v3"
+)
+
+// disallowUnknownFieldsOption is an option for unmarshal that determines whether unknown fields are allowed or not
+type disallowUnknownFieldsOption bool
+
+const (
+	// disallowUnknownFields returns strict errors if data contains unknown fields when decoding into typed structs
+	disallowUnknownFields disallowUnknownFieldsOption = true
+
+	// allowUnknownFields returns no errors if data contains unknown fields when decoding into typed structs
+	allowUnknownFields disallowUnknownFieldsOption = false
 )
 
 // Marshal marshals obj into JSON using stdlib json.Marshal, and then converts JSON to YAML using JSONToYAML (see that method for more reference)
 func Marshal(obj interface{}) ([]byte, error) {
+	if yamlNode, ok := obj.(*yamlv3.Node); ok {
+		var buf bytes.Buffer
+		if err := yamlNode.Decode(&buf); err != nil {
+			return nil, err
+		}
+		return buf.Bytes(), nil
+	}
+
 	jsonBytes, err := json.Marshal(obj)
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling into JSON: %w", err)
@@ -45,79 +66,72 @@ type JSONOpt func(*json.Decoder) *json.Decoder
 //
 // Important notes about the Unmarshal logic:
 //
-//   - Decoding is case-insensitive, unlike the rest of Kubernetes API machinery, as this is using the stdlib json library. This might be confusing to users.
-//   - This decodes any number (although it is an integer) into a float64 if the type of obj is unknown, e.g. *map[string]interface{}, *interface{}, or *[]interface{}. This means integers above +/- 2^53 will lose precision when round-tripping. Make a JSONOpt that calls d.UseNumber() to avoid this.
-//   - Duplicate fields, including in-case-sensitive matches, are ignored in an undefined order. Note that the YAML specification forbids duplicate fields, so this logic is more permissive than it needs to. See UnmarshalStrict for an alternative.
-//   - Unknown fields, i.e. serialized data that do not map to a field in obj, are ignored. Use d.DisallowUnknownFields() or UnmarshalStrict to override.
-//   - As per the YAML 1.1 specification, which yaml.v2 used underneath implements, literal 'yes' and 'no' strings without quotation marks will be converted to true/false implicitly.
+//   - Decoding is case-sensitive, just like the rest of the Kubernetes API machinery decoder logic, but unlike the standard library JSON encoder.
+//   - Duplicate fields (only case-sensitive matches) in objects result in a fatal error, as defined in the YAML spec.
+//   - The sequence indentation style is wide, which means that the "- " marker for a YAML sequence will NOT be on the same indentation level as the sequence field name, but two spaces more indented.
+//   - Unknown fields, i.e. serialized data that do not map to a field in obj, are ignored. Use UnmarshalStrict to override.
 //   - YAML non-string keys, e.g. ints, bools and floats, are converted to strings implicitly during the YAML to JSON conversion process.
 //   - There are no compatibility guarantees for returned error values.
 func Unmarshal(yamlBytes []byte, obj interface{}, opts ...JSONOpt) error {
-	return unmarshal(yamlBytes, obj, yaml.Unmarshal, opts...)
+	_, err := unmarshal(yamlBytes, obj, allowUnknownFields)
+	return err
 }
 
 // UnmarshalStrict is similar to Unmarshal (please read its documentation for reference), with the following exceptions:
 //
-//   - Duplicate fields in an object yield an error. This is according to the YAML specification.
-//   - If obj, or any of its recursive children, is a struct, presence of fields in the serialized data unknown to the struct will yield an error.
+//   - If obj, or any of its recursive children, is a struct, presence of fields in the serialized data unknown to the struct will yield a strict error.
 func UnmarshalStrict(yamlBytes []byte, obj interface{}, opts ...JSONOpt) error {
-	return unmarshal(yamlBytes, obj, yaml.UnmarshalStrict, append(opts, DisallowUnknownFields)...)
+	_, err := unmarshal(yamlBytes, obj, disallowUnknownFields)
+	return err
 }
 
 // unmarshal unmarshals the given YAML byte stream into the given interface,
 // optionally performing the unmarshalling strictly
-func unmarshal(yamlBytes []byte, obj interface{}, unmarshalFn func([]byte, interface{}) error, opts ...JSONOpt) error {
+func unmarshal(yamlBytes []byte, obj interface{}, unknownFieldsOption disallowUnknownFieldsOption) (strictErrors []error, err error) {
+	if yamlNode, ok := obj.(*yamlv3.Node); ok {
+		if err := yamlNode.Encode(yamlBytes); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+
 	jsonTarget := reflect.ValueOf(obj)
-
-	jsonBytes, err := yamlToJSONTarget(yamlBytes, &jsonTarget, unmarshalFn)
-	if err != nil {
-		return fmt.Errorf("error converting YAML to JSON: %w", err)
+	if jsonTarget.Kind() != reflect.Ptr || jsonTarget.IsNil() {
+		return nil, fmt.Errorf("provided object is not a valid pointer")
 	}
 
-	err = jsonUnmarshal(bytes.NewReader(jsonBytes), obj, opts...)
-	if err != nil {
-		return fmt.Errorf("error unmarshaling JSON: %w", err)
-	}
-
-	return nil
-}
-
-// jsonUnmarshal unmarshals the JSON byte stream from the given reader into the
-// object, optionally applying decoder options prior to decoding.  We are not
-// using json.Unmarshal directly as we want the chance to pass in non-default
-// options.
-func jsonUnmarshal(reader io.Reader, obj interface{}, opts ...JSONOpt) error {
-	d := json.NewDecoder(reader)
-	for _, opt := range opts {
-		d = opt(d)
-	}
-	if err := d.Decode(&obj); err != nil {
-		return fmt.Errorf("while decoding JSON: %v", err)
-	}
-	return nil
-}
-
-// JSONToYAML converts JSON to YAML. Notable implementation details:
-//
-//   - Duplicate fields, are case-sensitively ignored in an undefined order.
-//   - The sequence indentation style is compact, which means that the "- " marker for a YAML sequence will be on the same indentation level as the sequence field name.
-//   - Unlike Unmarshal, all integers, up to 64 bits, are preserved during this round-trip.
-func JSONToYAML(j []byte) ([]byte, error) {
-	// Convert the JSON to an object.
-	var jsonObj interface{}
-
-	// We are using yaml.Unmarshal here (instead of json.Unmarshal) because the
-	// Go JSON library doesn't try to pick the right number type (int, float,
-	// etc.) when unmarshalling to interface{}, it just picks float64
-	// universally. go-yaml does go through the effort of picking the right
-	// number type, so we can preserve number type throughout this process.
-	err := yaml.Unmarshal(j, &jsonObj)
+	jsonBytes, err := yamlToJSONTarget(yamlBytes, &jsonTarget)
 	if err != nil {
 		return nil, err
 	}
 
+	// Decode jsonBytes into obj.
+	if unknownFieldsOption == disallowUnknownFields {
+		strictErrors, err = kubejson.UnmarshalStrict(jsonBytes, &obj, kubejson.DisallowUnknownFields)
+	} else {
+		strictErrors, err = kubejson.UnmarshalStrict(jsonBytes, &obj)
+	}
+
+	if err != nil {
+		return strictErrors, fmt.Errorf("error unmarshaling JSON: %w", err)
+	}
+
+	return strictErrors, nil
+}
+
+// JSONToYAML converts JSON to YAML. Notable implementation details:
+//
+//   - Duplicate fields (only case-sensitive matches) in objects result in a fatal error, as defined in the YAML spec.
+func JSONToYAML(jsonBytes []byte) ([]byte, error) {
+	// Convert the JSON to an object.
+	var jsonObj interface{}
+
+	if err := kubejson.UnmarshalCaseSensitivePreserveInts(jsonBytes, &jsonObj); err != nil {
+		return nil, fmt.Errorf("error converting JSON to YAML: %w", err)
+	}
+
 	// Marshal this object into YAML.
-	yamlBytes, err := yaml.Marshal(jsonObj)
+	yamlBytes, err := yamlv2.Marshal(jsonObj)
 	if err != nil {
 		return nil, err
 	}
@@ -139,24 +153,22 @@ func JSONToYAML(j []byte) ([]byte, error) {
 //
 // Notable about the implementation:
 //
-// - Duplicate fields are case-sensitively ignored in an undefined order. Note that the YAML specification forbids duplicate fields, so this logic is more permissive than it needs to. See YAMLToJSONStrict for an alternative.
-// - As per the YAML 1.1 specification, which yaml.v2 used underneath implements, literal 'yes' and 'no' strings without quotation marks will be converted to true/false implicitly.
-// - Unlike Unmarshal, all integers, up to 64 bits, are preserved during this round-trip.
+// - Duplicate fields (only case-sensitive matches) in objects result in a fatal error, as defined in the YAML spec.
 // - There are no compatibility guarantees for returned error values.
-func YAMLToJSON(y []byte) ([]byte, error) {
-	return yamlToJSONTarget(y, nil, yaml.Unmarshal)
+func YAMLToJSON(yamlBytes []byte) ([]byte, error) {
+	return yamlToJSONTarget(yamlBytes, nil)
 }
 
 // YAMLToJSONStrict is like YAMLToJSON but enables strict YAML decoding,
 // returning an error on any duplicate field names.
 func YAMLToJSONStrict(y []byte) ([]byte, error) {
-	return yamlToJSONTarget(y, nil, yaml.UnmarshalStrict)
+	return yamlToJSONTarget(y, nil) // TODO: yaml.UnmarshalStrict
 }
 
-func yamlToJSONTarget(yamlBytes []byte, jsonTarget *reflect.Value, unmarshalFn func([]byte, interface{}) error) ([]byte, error) {
+func yamlToJSONTarget(yamlBytes []byte, jsonTarget *reflect.Value) (jsonBytes []byte, err error) {
 	// Convert the YAML to an object.
 	var yamlObj interface{}
-	err := unmarshalFn(yamlBytes, &yamlObj)
+	err = yamlv3.Unmarshal(yamlBytes, &yamlObj)
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +183,7 @@ func yamlToJSONTarget(yamlBytes []byte, jsonTarget *reflect.Value, unmarshalFn f
 	}
 
 	// Convert this object to JSON and return the data.
-	jsonBytes, err := json.Marshal(jsonObj)
+	jsonBytes, err = json.Marshal(jsonObj)
 	if err != nil {
 		return nil, err
 	}
@@ -186,14 +198,16 @@ func convertToJSONableObject(yamlObj interface{}, jsonTarget *reflect.Value) (in
 	// decoding into the value, we're just checking if the ultimate target is a
 	// string.
 	if jsonTarget != nil {
-		jsonUnmarshaler, textUnmarshaler, pointerValue := indirect(*jsonTarget, false)
-		// We have a JSON or Text Umarshaler at this level, so we can't be trying
-		// to decode into a string.
-		if jsonUnmarshaler != nil || textUnmarshaler != nil {
-			jsonTarget = nil
-		} else {
-			jsonTarget = &pointerValue
+		jsonTarget = indirect(*jsonTarget)
+	}
+
+	// Transform map[string]interface{} into map[interface{}]interface{}
+	if stringMap, ok := yamlObj.(map[string]interface{}); ok {
+		interfaceMap := make(map[interface{}]interface{})
+		for k, v := range stringMap {
+			interfaceMap[k] = v
 		}
+		yamlObj = interfaceMap
 	}
 
 	// If yamlObj is a number or a boolean, check if jsonTarget is a string -
@@ -256,25 +270,30 @@ func convertToJSONableObject(yamlObj interface{}, jsonTarget *reflect.Value) (in
 			if jsonTarget != nil {
 				t := *jsonTarget
 				if t.Kind() == reflect.Struct {
-					keyBytes := []byte(keyString)
 					// Find the field that the JSON library would use.
 					var f *field
 					fields := cachedTypeFields(t.Type())
 					for i := range fields {
-						ff := &fields[i]
-						if bytes.Equal(ff.nameBytes, keyBytes) {
-							f = ff
+						f = &fields[i]
+						if f.name == keyString {
 							break
 						}
-						// Do case-insensitive comparison.
-						if f == nil && ff.equalFold(ff.nameBytes, keyBytes) {
-							f = ff
-						}
 					}
+
 					if f != nil {
 						// Find the reflect.Value of the most preferential
 						// struct field.
-						jtf := t.Field(f.index[0])
+						jtf := t
+						for _, i := range f.index {
+							if jtf.Kind() == reflect.Ptr {
+								if jtf.IsNil() {
+									jtf = reflect.New(jtf.Type().Elem())
+								}
+								jtf = jtf.Elem()
+							}
+							jtf = jtf.Field(i)
+						}
+
 						strMap[keyString], err = convertToJSONableObject(v, &jtf)
 						if err != nil {
 							return nil, err
@@ -339,7 +358,7 @@ func convertToJSONableObject(yamlObj interface{}, jsonTarget *reflect.Value) (in
 			case int64:
 				s = strconv.FormatInt(typedVal, 10)
 			case float64:
-				s = strconv.FormatFloat(typedVal, 'g', -1, 32)
+				s = strconv.FormatFloat(typedVal, 'g', -1, 64)
 			case uint64:
 				s = strconv.FormatUint(typedVal, 10)
 			case bool:
@@ -353,6 +372,7 @@ func convertToJSONableObject(yamlObj interface{}, jsonTarget *reflect.Value) (in
 				yamlObj = interface{}(s)
 			}
 		}
+
 		return yamlObj, nil
 	}
 }
@@ -370,13 +390,13 @@ func convertToJSONableObject(yamlObj interface{}, jsonTarget *reflect.Value) (in
 // Big int/int64/uint64 do not lose precision as in the json-yaml roundtripping case.
 //
 // string, bool and any other types are unchanged.
-func JSONObjectToYAMLObject(j map[string]interface{}) yaml.MapSlice {
+func JSONObjectToYAMLObject(j map[string]interface{}) yamlv2.MapSlice {
 	if len(j) == 0 {
 		return nil
 	}
-	ret := make(yaml.MapSlice, 0, len(j))
+	ret := make(yamlv2.MapSlice, 0, len(j))
 	for k, v := range j {
-		ret = append(ret, yaml.MapItem{Key: k, Value: jsonToYAMLValue(v)})
+		ret = append(ret, yamlv2.MapItem{Key: k, Value: jsonToYAMLValue(v)})
 	}
 	return ret
 }
